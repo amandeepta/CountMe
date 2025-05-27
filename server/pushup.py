@@ -1,74 +1,106 @@
-import numpy as np
-from collections import deque
+import cv2
 import mediapipe as mp
+import numpy as np
+import sys
 
-class PushupCounter:
-    def __init__(self):
-        self.pushup_count = 0
-        self.stage = None
-        self.elbow_angles = deque(maxlen=5)  # smoother with fixed maxlen
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
 
-    def calculate_angle(self, a, b, c):
-        # a, b, c are 3D points [x,y,z]
-        a = np.array(a)
-        b = np.array(b)
-        c = np.array(c)
-        ba = a - b
-        bc = c - b
-        cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8)
-        cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
-        angle = np.arccos(cosine_angle)
-        return np.degrees(angle)
 
-    def is_body_horizontal(self, shoulder, hip, knee, threshold=20):
-        # Check if body is roughly horizontal by angle between shoulder-hip-knee
-        angle = self.calculate_angle(shoulder, hip, knee)
-        return (90 - threshold) < angle < (90 + threshold)
+def calculate_angle(a, b, c):
+    a = np.array(a)
+    b = np.array(b)
+    c = np.array(c)
 
-    def smooth_angle(self, new_angle):
-        self.elbow_angles.append(new_angle)
-        return np.mean(self.elbow_angles)
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+    angle = np.abs(radians * 180.0 / np.pi)
+    if angle > 180.0:
+        angle = 360 - angle
+    return angle
 
-    def update(self, landmarks):
-        mp_pose = mp.solutions.pose
 
-        # Extract 3D coordinates for right side keypoints
-        shoulder = [landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
-                    landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y,
-                    landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].z]
+# Video capture from webcam or file
+if len(sys.argv) > 1:
+    cap = cv2.VideoCapture(sys.argv[1])
+else:
+    cap = cv2.VideoCapture(0)
 
-        elbow = [landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].x,
-                 landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].y,
-                 landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].z]
+counter = 0
+position = "UP"
 
-        wrist = [landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x,
-                 landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y,
-                 landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].z]
+with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            print("Error: Frame not captured. Exiting...")
+            break
 
-        hip = [landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
-               landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y,
-               landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].z]
+        # Resize and convert to RGB
+        frame = cv2.resize(frame, (960, 540))
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image.flags.writeable = False
 
-        knee = [landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
-                landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].y,
-                landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].z]
+        # Pose detection
+        results = pose.process(image)
+        image.flags.writeable = True
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-        # Calculate elbow angle and smooth it
-        raw_elbow_angle = self.calculate_angle(shoulder, elbow, wrist)
-        elbow_angle = self.smooth_angle(raw_elbow_angle)
+        try:
+            landmarks = results.pose_landmarks.landmark
 
-        # Check if body is horizontal enough to consider pushup movement valid
-        horizontal = self.is_body_horizontal(shoulder, hip, knee)
+            # Get keypoints
+            l_shldr = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x,
+                       landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
+            l_elbow = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x,
+                       landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y]
+            l_wrist = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x,
+                       landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y]
 
-        # Pushup counting logic
-        if horizontal:
-            if self.stage in [None, 'up'] and elbow_angle < 90:
-                self.stage = 'down'
-            elif self.stage == 'down' and elbow_angle > 160:
-                self.stage = 'up'
-                self.pushup_count += 1
-        else:
-            # Reset stage if body is not horizontal (prevents false counts)
-            self.stage = None
+            r_shldr = [landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
+                       landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
+            r_elbow = [landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].x,
+                       landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].y]
+            r_wrist = [landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x,
+                       landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y]
 
-        return self.pushup_count, int(elbow_angle), horizontal
+            # Calculate average elbow angle
+            l_angle = calculate_angle(l_shldr, l_elbow, l_wrist)
+            r_angle = calculate_angle(r_shldr, r_elbow, r_wrist)
+            avg_angle = (l_angle + r_angle) / 2
+
+            # Push-up counter logic
+            if avg_angle > 160:
+                position = "UP"
+            if avg_angle < 70 and position == "UP":
+                position = "DOWN"
+                counter += 1
+                print(f"Push-up count: {counter}")
+
+        except Exception as e:
+            position = "Not detected"
+
+        # Draw status
+        cv2.rectangle(image, (0, 0), (300, 73), (245, 110, 16), -1)
+        cv2.putText(image, 'REPS', (15, 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(image, str(counter),
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
+
+        cv2.putText(image, 'STAGE', (100, 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(image, position,
+                    (100, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Render landmarks
+        if results.pose_landmarks:
+            mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                      mp_drawing.DrawingSpec(color=(245, 114, 67), thickness=2, circle_radius=2),
+                                      mp_drawing.DrawingSpec(color=(245, 69, 222), thickness=2, circle_radius=2))
+
+        cv2.imshow('Push-up Counter', image)
+
+        if cv2.waitKey(10) & 0xFF == ord('q'):
+            break
+
+cap.release()
+cv2.destroyAllWindows()

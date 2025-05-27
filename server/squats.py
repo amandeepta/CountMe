@@ -1,96 +1,128 @@
-import numpy as np
-from collections import deque
+import sys
 import mediapipe as mp
+import cv2
+import numpy as np
 
-class SquatCounter:
-    def __init__(self):
-        self.squat_count = 0
-        self.stage = None
-        self.knee_angles = deque(maxlen=7)  # Slightly larger smoothing window
-        self.stage_hold_frames = 0
-        self.min_hold_frames = 5  # Require pose to be stable for 5 frames
-
-    def calculate_angle(self, a, b, c):
-        a = np.array(a)
-        b = np.array(b)
-        c = np.array(c)
-        ba = a - b
-        bc = c - b
+def findAngle(a, b, c, minVis=0.8):
+    if a.visibility > minVis and b.visibility > minVis and c.visibility > minVis:
+        bc = np.array([c.x - b.x, c.y - b.y, c.z - b.z])
+        ba = np.array([a.x - b.x, a.y - b.y, a.z - b.z])
         cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8)
-        cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
-        angle = np.arccos(cosine_angle)
-        return np.degrees(angle)
+        angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0)) * (180 / np.pi)
+        if angle > 180:
+            angle = 360 - angle
+        return angle
+    else:
+        return -1
 
-    def median_angle(self, new_angle):
-        self.knee_angles.append(new_angle)
-        return np.median(self.knee_angles)
+def legState(angle):
+    if angle < 0:
+        return 0  # Not detected
+    elif angle <= 70:
+        return 1  # Squat (bent)
+    else:
+        return 2  # Standing (extended)
 
-    def torso_angle(self, shoulder, hip, knee):
-        # Angle at hip between shoulder-hip-knee (measures torso lean)
-        return self.calculate_angle(shoulder, hip, knee)
+def feedbackMessage(rState, lState):
+    if rState == 0 or lState == 0:
+        msgs = []
+        if rState == 0:
+            msgs.append("Right leg not detected")
+        if lState == 0:
+            msgs.append("Left leg not detected")
+        return ", ".join(msgs)
+    if rState == 1 and lState == 1:
+        return "Squatting"
+    if rState == 2 and lState == 2:
+        return "Standing"
+    return "Uneven leg positions"
 
-    def update(self, landmarks):
-        mp_pose = mp.solutions.pose
-        
-        # Extract key landmarks for right and left
-        def get_point(lm, idx):
-            p = lm[idx]
-            return [p.x, p.y, p.z]
+if __name__ == "__main__":
+    mp_drawing = mp.solutions.drawing_utils
+    mp_pose = mp.solutions.pose
 
-        r_shoulder = get_point(landmarks, mp_pose.PoseLandmark.RIGHT_SHOULDER.value)
-        r_hip = get_point(landmarks, mp_pose.PoseLandmark.RIGHT_HIP.value)
-        r_knee = get_point(landmarks, mp_pose.PoseLandmark.RIGHT_KNEE.value)
-        r_ankle = get_point(landmarks, mp_pose.PoseLandmark.RIGHT_ANKLE.value)
+    if len(sys.argv) < 2:
+        cap = cv2.VideoCapture(1)  # Webcam index 0
+        if not cap.isOpened():
+            print("Error: Cannot open webcam")
+            sys.exit(1)
+    else:
+        video_path = sys.argv[1]
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"Error: Cannot open video file {video_path}")
+            sys.exit(1)
 
-        l_shoulder = get_point(landmarks, mp_pose.PoseLandmark.LEFT_SHOULDER.value)
-        l_hip = get_point(landmarks, mp_pose.PoseLandmark.LEFT_HIP.value)
-        l_knee = get_point(landmarks, mp_pose.PoseLandmark.LEFT_KNEE.value)
-        l_ankle = get_point(landmarks, mp_pose.PoseLandmark.LEFT_ANKLE.value)
+    repCount = 0
 
-        # Calculate knee angles and torso angles both sides
-        r_knee_angle = self.calculate_angle(r_hip, r_knee, r_ankle)
-        l_knee_angle = self.calculate_angle(l_hip, l_knee, l_ankle)
-        avg_knee_angle = (r_knee_angle + l_knee_angle) / 2
+    # States for squat detection:
+    # 0 = waiting to start (assume standing)
+    # 1 = squat detected (down)
+    # 2 = standing detected after squat (up)
+    state = 0
 
-        r_torso_angle = self.torso_angle(r_shoulder, r_hip, r_knee)
-        l_torso_angle = self.torso_angle(l_shoulder, l_hip, l_knee)
-        avg_torso_angle = (r_torso_angle + l_torso_angle) / 2
+    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        # Median smooth knee angle to reduce noise spikes
-        knee_angle = self.median_angle(avg_knee_angle)
+            frame = cv2.resize(frame, (1024, 600))
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_rgb.flags.writeable = False
 
-        # Vertical position checks:
-        # 1) Hip above knee (y-axis)
-        hip_y = (r_hip[1] + l_hip[1]) / 2
-        knee_y = (r_knee[1] + l_knee[1]) / 2
-        ankle_y = (r_ankle[1] + l_ankle[1]) / 2
+            results = pose.process(frame_rgb)
+            frame_rgb.flags.writeable = True
 
-        hip_above_knee = hip_y < knee_y + 0.1
-        hip_above_ankle = hip_y < ankle_y + 0.2
+            if results.pose_landmarks:
+                lm_arr = results.pose_landmarks.landmark
 
-        # Torso should be roughly vertical (angle close to 180 degrees)
-        torso_upright = avg_torso_angle > 140
+                rAngle = findAngle(lm_arr[24], lm_arr[26], lm_arr[28])
+                lAngle = findAngle(lm_arr[23], lm_arr[25], lm_arr[27])
 
-        # Confirm correct squat posture
-        posture_ok = hip_above_knee and hip_above_ankle and torso_upright
+                rState = legState(rAngle)
+                lState = legState(lAngle)
 
-        # Squat counting with hold frame hysteresis to avoid flickering
-        if posture_ok:
-            if self.stage in [None, 'up'] and knee_angle < 110:
-                self.stage_hold_frames += 1
-                if self.stage_hold_frames >= self.min_hold_frames:
-                    self.stage = 'down'
-                    self.stage_hold_frames = 0
-            elif self.stage == 'down' and knee_angle > 150:
-                self.stage_hold_frames += 1
-                if self.stage_hold_frames >= self.min_hold_frames:
-                    self.stage = 'up'
-                    self.squat_count += 1
-                    self.stage_hold_frames = 0
+                # Only consider squat if both legs are detected and consistent
+                if rState != 0 and lState != 0:
+                    # Determine combined state: 1 if both squat, 2 if both standing, else 0 (uneven)
+                    combinedState = 0
+                    if rState == 1 and lState == 1:
+                        combinedState = 1  # Squat down
+                    elif rState == 2 and lState == 2:
+                        combinedState = 2  # Standing up
+
+                    # State machine for counting reps
+                    if state == 0 and combinedState == 2:
+                        # Starting position is standing
+                        state = 2
+                    elif state == 2 and combinedState == 1:
+                        # Went down into squat
+                        state = 1
+                    elif state == 1 and combinedState == 2:
+                        # Back up after squat: count 1 rep
+                        repCount += 1
+                        state = 2
+
+                fb = feedbackMessage(rState, lState)
+
+                mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                          mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                                          mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2, circle_radius=2))
+
+                cv2.putText(frame, f'Squats: {repCount}', (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                            1, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(frame, fb, (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (0, 255, 255), 2, cv2.LINE_AA)
+
             else:
-                self.stage_hold_frames = 0
-        else:
-            self.stage = None
-            self.stage_hold_frames = 0
+                cv2.putText(frame, "No pose detected", (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                            1, (0, 0, 255), 2, cv2.LINE_AA)
 
-        return self.squat_count, int(knee_angle), posture_ok
+            cv2.imshow("Squat Rep Counter", frame)
+
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+    cap.release()
+    cv2.destroyAllWindows()
