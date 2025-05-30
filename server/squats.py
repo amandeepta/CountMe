@@ -1,128 +1,89 @@
-import sys
-import mediapipe as mp
+# squat_counter.py
+
 import cv2
 import numpy as np
+import mediapipe as mp
 
-def findAngle(a, b, c, minVis=0.8):
-    if a.visibility > minVis and b.visibility > minVis and c.visibility > minVis:
+def _find_angle(a, b, c, min_vis=0.8):
+    if a.visibility > min_vis and b.visibility > min_vis and c.visibility > min_vis:
         bc = np.array([c.x - b.x, c.y - b.y, c.z - b.z])
         ba = np.array([a.x - b.x, a.y - b.y, a.z - b.z])
-        cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8)
-        angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0)) * (180 / np.pi)
-        if angle > 180:
-            angle = 360 - angle
-        return angle
-    else:
-        return -1
+        cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8)
+        angle = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+        return 360 - angle if angle > 180 else angle
+    return -1.0
 
-def legState(angle):
+def _leg_state(angle):
     if angle < 0:
-        return 0  # Not detected
-    elif angle <= 70:
-        return 1  # Squat (bent)
-    else:
-        return 2  # Standing (extended)
+        return 0
+    return 1 if angle <= 70 else 2
 
-def feedbackMessage(rState, lState):
-    if rState == 0 or lState == 0:
-        msgs = []
-        if rState == 0:
-            msgs.append("Right leg not detected")
-        if lState == 0:
-            msgs.append("Left leg not detected")
-        return ", ".join(msgs)
-    if rState == 1 and lState == 1:
-        return "Squatting"
-    if rState == 2 and lState == 2:
-        return "Standing"
-    return "Uneven leg positions"
+class SquatCounter:
+    def __init__(self, min_detection_confidence=0.5, min_tracking_confidence=0.5):
+        self.pose = mp.solutions.pose.Pose(
+            min_detection_confidence=min_detection_confidence,
+            min_tracking_confidence=min_tracking_confidence
+        )
+        self.drawing = mp.solutions.drawing_utils
+        self.rep_count = 0
+        self._state = 0
 
-if __name__ == "__main__":
-    mp_drawing = mp.solutions.drawing_utils
-    mp_pose = mp.solutions.pose
+    def process(self, frame):
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image.flags.writeable = False
+        results = self.pose.process(image)
+        image.flags.writeable = True
 
-    if len(sys.argv) < 2:
-        cap = cv2.VideoCapture(1)  # Webcam index 0
-        if not cap.isOpened():
-            print("Error: Cannot open webcam")
-            sys.exit(1)
-    else:
-        video_path = sys.argv[1]
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"Error: Cannot open video file {video_path}")
-            sys.exit(1)
+        if results.pose_landmarks:
+            lm = results.pose_landmarks.landmark
+            r_angle = _find_angle(lm[24], lm[26], lm[28])
+            l_angle = _find_angle(lm[23], lm[25], lm[27])
+            r_state = _leg_state(r_angle)
+            l_state = _leg_state(l_angle)
 
-    repCount = 0
+            combined = 0
+            if r_state == 1 and l_state == 1:
+                combined = 1
+            elif r_state == 2 and l_state == 2:
+                combined = 2
 
-    # States for squat detection:
-    # 0 = waiting to start (assume standing)
-    # 1 = squat detected (down)
-    # 2 = standing detected after squat (up)
-    state = 0
+            if self._state == 0 and combined == 2:
+                self._state = 2
+            elif self._state == 2 and combined == 1:
+                self._state = 1
+            elif self._state == 1 and combined == 2:
+                self.rep_count += 1
+                self._state = 2
 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            self.drawing.draw_landmarks(
+                frame,
+                results.pose_landmarks,
+                mp.solutions.pose.POSE_CONNECTIONS,
+                self.drawing.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=2),
+                self.drawing.DrawingSpec(color=(0,0,255), thickness=2, circle_radius=2)
+            )
 
-            frame = cv2.resize(frame, (1024, 600))
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_rgb.flags.writeable = False
+            fb = []
+            if r_state == 0:
+                fb.append("Right leg not detected")
+            if l_state == 0:
+                fb.append("Left leg not detected")
+            if not fb:
+                if combined == 1:
+                    fb = ["Squatting"]
+                elif combined == 2:
+                    fb = ["Standing"]
+                else:
+                    fb = ["Uneven leg positions"]
+            msg = ", ".join(fb)
 
-            results = pose.process(frame_rgb)
-            frame_rgb.flags.writeable = True
+            cv2.putText(frame, f'Squats: {self.rep_count}', (20,40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2, cv2.LINE_AA)
+            cv2.putText(frame, msg, (20,80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2, cv2.LINE_AA)
 
-            if results.pose_landmarks:
-                lm_arr = results.pose_landmarks.landmark
+        return frame, self.rep_count
 
-                rAngle = findAngle(lm_arr[24], lm_arr[26], lm_arr[28])
-                lAngle = findAngle(lm_arr[23], lm_arr[25], lm_arr[27])
-
-                rState = legState(rAngle)
-                lState = legState(lAngle)
-
-                # Only consider squat if both legs are detected and consistent
-                if rState != 0 and lState != 0:
-                    # Determine combined state: 1 if both squat, 2 if both standing, else 0 (uneven)
-                    combinedState = 0
-                    if rState == 1 and lState == 1:
-                        combinedState = 1  # Squat down
-                    elif rState == 2 and lState == 2:
-                        combinedState = 2  # Standing up
-
-                    # State machine for counting reps
-                    if state == 0 and combinedState == 2:
-                        # Starting position is standing
-                        state = 2
-                    elif state == 2 and combinedState == 1:
-                        # Went down into squat
-                        state = 1
-                    elif state == 1 and combinedState == 2:
-                        # Back up after squat: count 1 rep
-                        repCount += 1
-                        state = 2
-
-                fb = feedbackMessage(rState, lState)
-
-                mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                                          mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
-                                          mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2, circle_radius=2))
-
-                cv2.putText(frame, f'Squats: {repCount}', (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                            1, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.putText(frame, fb, (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8, (0, 255, 255), 2, cv2.LINE_AA)
-
-            else:
-                cv2.putText(frame, "No pose detected", (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                            1, (0, 0, 255), 2, cv2.LINE_AA)
-
-            cv2.imshow("Squat Rep Counter", frame)
-
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
-
-    cap.release()
-    cv2.destroyAllWindows()
+    def reset(self):
+        self.rep_count = 0
+        self._state = 0
